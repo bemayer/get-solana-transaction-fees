@@ -239,15 +239,9 @@ fn build_transaction_item(
 /// Fetches and processes a single slot's transactions.
 async fn process_slot(
     slot: u64,
-    processed_slots: &mut HashSet<u64>,
     connection: &RpcClient,
     dynamo_client: &DynamoDbClient,
 ) -> Result<()> {
-    if processed_slots.contains(&slot) {
-        info!("Slot {} already processed. Skipping.", slot);
-        return Ok(());
-    }
-
     let block = connection
         .get_block_with_config(
             slot,
@@ -283,14 +277,10 @@ async fn process_slot(
 
     // Send all batches concurrently
     let futures = batches.iter().map(|batch| {
-        let dynamo_client = dynamo_client.clone();
         async move { send_batch(&dynamo_client, batch).await }
     });
 
     join_all(futures).await;
-
-    processed_slots.insert(slot);
-    save_processed_slots(PROCESSED_SLOTS_FILE, processed_slots)?;
 
     Ok(())
 }
@@ -332,12 +322,20 @@ async fn main() -> Result<()> {
                 while slot > 0 {
                     let start_time = Instant::now();
 
-                    if let Err(e) = process_slot(slot, &mut processed_slots, &connection, &dynamo_client).await {
+                    if processed_slots.contains(&slot) {
+                        info!("Slot {} already processed. Skipping.", slot);
+                        return Ok(());
+                    }
+
+                    if let Err(e) = process_slot(slot, &connection, &dynamo_client).await {
                         error!("Error processing slot {}: {}", slot, e);
                         // Depending on the error, decide to continue or break
                         slot -= 1;
                         continue;
                     }
+
+                    processed_slots.insert(slot);
+                    save_processed_slots(PROCESSED_SLOTS_FILE, &processed_slots)?;
 
                     let elapsed = start_time.elapsed();
                     total_time += elapsed;
