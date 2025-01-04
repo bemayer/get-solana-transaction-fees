@@ -1,0 +1,11 @@
+{
+  "configurations": [
+    {
+      "type": "lldb",
+      "request": "launch",
+      "name": "Launch Program",
+      "program": "${workspaceFolder}/target/debug/get-solana-transaction-fees",
+      "preLaunchTask": "cargo build"
+    }
+  ]
+}
