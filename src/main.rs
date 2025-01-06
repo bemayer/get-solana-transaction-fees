@@ -2,18 +2,25 @@ use anyhow::{anyhow, Context, Result};
 use aws_config::BehaviorVersion;
 use aws_sdk_dynamodb::client::Waiters;
 use aws_sdk_dynamodb::types::{
-    AttributeValue, BillingMode, KeySchemaElement, KeyType, PutRequest, WriteRequest,
+    AttributeDefinition, AttributeValue, BillingMode, KeySchemaElement, KeyType, PutRequest, ScalarAttributeType, WriteRequest
 };
 use aws_sdk_dynamodb::Client as DynamoDbClient;
 use futures::future::join_all;
 use log::{error, info, warn};
+use solana_client::client_error::ClientError;
 use solana_client::nonblocking::rpc_client::RpcClient;
+use solana_client::rpc_config::RpcBlockConfig;
 use solana_sdk::commitment_config::CommitmentConfig;
-use solana_transaction_status::{EncodedTransaction, EncodedTransactionWithStatusMeta};
+use solana_transaction_status::{
+    EncodedTransaction, EncodedTransactionWithStatusMeta, UiConfirmedBlock,
+};
 use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use tokio::signal;
+use tokio::sync::Semaphore;
 use tokio::time::{sleep, Instant};
 
 // -----------------------
@@ -22,8 +29,9 @@ use tokio::time::{sleep, Instant};
 const TABLE_NAME: &str = "SolanaFees";
 const BASE_FEE: u64 = 5000;
 const BATCH_SIZE: usize = 25;
+const MAX_PARALLEL_REQUESTS: usize = 5;
 const SOLANA_URL: &str = "https://api.mainnet-beta.solana.com";
-const PROCESSED_SLOTS_FILE: &str = "../processedSlots.json";
+const PROCESSED_SLOTS_FILE: &str = "~/processedSlots.json";
 
 // -----------------------
 // Data Structures
@@ -117,7 +125,7 @@ fn save_processed_slots<P: AsRef<Path>>(path: P, slots: &HashSet<u64>) -> Result
 }
 
 /// Ensures the DynamoDB table exists. Creates it if it does not.
-async fn ensure_table_exists(dynamo_client: &DynamoDbClient) -> Result<()> {
+async fn ensure_table_exists(dynamo_client: &Arc<DynamoDbClient>) -> Result<()> {
     match dynamo_client
         .describe_table()
         .table_name(TABLE_NAME)
@@ -140,16 +148,34 @@ async fn ensure_table_exists(dynamo_client: &DynamoDbClient) -> Result<()> {
 }
 
 /// Creates the DynamoDB table.
-async fn create_table(dynamo_client: &DynamoDbClient) -> Result<()> {
-    let key_schema = KeySchemaElement::builder()
-        .attribute_name("Signature")
+async fn create_table(dynamo_client: &Arc<DynamoDbClient>) -> Result<()> {
+    let slot_key = KeySchemaElement::builder()
+        .attribute_name("Slot")
         .key_type(KeyType::Hash)
+        .build()?;
+
+    let signature_key = KeySchemaElement::builder()
+        .attribute_name("Signature")
+        .key_type(KeyType::Range)
+        .build()?;
+
+    let slot_definition = AttributeDefinition::builder()
+        .attribute_name("Slot")
+        .attribute_type(ScalarAttributeType::N)
+        .build()?;
+
+    let signature_definition = AttributeDefinition::builder()
+        .attribute_name("Signature")
+        .attribute_type(ScalarAttributeType::S)
         .build()?;
 
     dynamo_client
         .create_table()
         .table_name(TABLE_NAME)
-        .key_schema(key_schema)
+        .key_schema(slot_key)
+        .key_schema(signature_key)
+        .attribute_definitions(slot_definition)
+        .attribute_definitions(signature_definition)
         .billing_mode(BillingMode::PayPerRequest)
         .send()
         .await
@@ -157,7 +183,6 @@ async fn create_table(dynamo_client: &DynamoDbClient) -> Result<()> {
 
     info!("Table \"{}\" is being created...", TABLE_NAME);
 
-    // Wait until the table is active
     dynamo_client
         .wait_until_table_exists()
         .table_name(TABLE_NAME)
@@ -170,7 +195,10 @@ async fn create_table(dynamo_client: &DynamoDbClient) -> Result<()> {
 }
 
 /// Sends a batch of write requests to DynamoDB.
-async fn send_batch(dynamo_client: &DynamoDbClient, write_requests: &[WriteRequest]) -> Result<()> {
+async fn send_batch(
+    dynamo_client: Arc<DynamoDbClient>,
+    write_requests: &[WriteRequest],
+) -> Result<()> {
     match dynamo_client
         .batch_write_item()
         .request_items(TABLE_NAME, write_requests.to_vec())
@@ -239,30 +267,14 @@ fn build_transaction_item(
 /// Fetches and processes a single slot's transactions.
 async fn process_slot(
     slot: u64,
-    connection: &RpcClient,
-    dynamo_client: &DynamoDbClient,
+    connection: Arc<RpcClient>,
+    dynamo_client: Arc<DynamoDbClient>,
 ) -> Result<()> {
-    let block = connection
-        .get_block_with_config(
-            slot,
-            solana_client::rpc_config::RpcBlockConfig {
-                commitment: Some(CommitmentConfig::confirmed()),
-                max_supported_transaction_version: Some(0),
-                ..Default::default()
-            },
-        )
-        .await
-        .with_context(|| format!("Could not fetch block {}", slot))
-        .ok();
+    let block = get_block(slot, connection).await?;
 
-    if block.is_none() {
-        info!("Block {} is null or not available.", slot);
-        return Ok(());
-    }
-
-    let block_height = block.as_ref().map_or(0, |b| b.block_height.unwrap_or(0));
-    let block_time = block.as_ref().map_or(0, |b| b.block_time.unwrap_or(0));
-    let transactions = block.unwrap().transactions.unwrap_or_default();
+    let block_height = block.block_height.unwrap_or(0);
+    let block_time = block.block_time.unwrap_or(0);
+    let transactions = block.transactions.unwrap_or_default();
 
     let mut write_requests = Vec::new();
 
@@ -272,97 +284,162 @@ async fn process_slot(
         }
     }
 
-    // Chunk the write requests
     let batches: Vec<&[WriteRequest]> = write_requests.chunks(BATCH_SIZE).collect();
 
-    // Send all batches concurrently
     let futures = batches.iter().map(|batch| {
-        async move { send_batch(&dynamo_client, batch).await }
+        let dynamo_client = Arc::clone(&dynamo_client);
+        async move { send_batch(dynamo_client, batch).await }
     });
 
     join_all(futures).await;
 
+    info!(
+        "Slot {} processed. Total transactions: {}",
+        slot,
+        transactions.len()
+    );
+
     Ok(())
+}
+
+async fn get_block(slot: u64, connection: Arc<RpcClient>) -> Result<UiConfirmedBlock, ClientError> {
+    let max_attempts = 5;
+    let delay = Duration::from_secs(10);
+
+    for attempt in 1..=max_attempts {
+        match connection
+            .get_block_with_config(
+                slot,
+                RpcBlockConfig {
+                    commitment: Some(CommitmentConfig::confirmed()),
+                    max_supported_transaction_version: Some(0),
+                    ..Default::default()
+                },
+            )
+            .await
+        {
+            Ok(block) => return Ok(block),
+            Err(e) => {
+                error!(
+                    "Attempt {}/{} failed to fetch block {}: {}",
+                    attempt, max_attempts, slot, e
+                );
+
+                if attempt < max_attempts {
+                    sleep(delay).await;
+                    continue;
+                }
+
+                return Err(e);
+            }
+        }
+    }
+
+    unreachable!()
 }
 
 // -----------------------
 // Main Logic
 // -----------------------
 
+/// Main function that processes Solana blocks.
 #[tokio::main]
 async fn main() -> Result<()> {
     env_logger::init();
 
-    // Load AWS configuration
     let aws_config = aws_config::load_defaults(BehaviorVersion::latest()).await;
-    let dynamo_client = DynamoDbClient::new(&aws_config);
+    let dynamo_client = Arc::new(DynamoDbClient::new(&aws_config));
 
-    // Ensure DynamoDB table exists
     ensure_table_exists(&dynamo_client).await?;
 
-    // Initialize Solana RPC client
-    let connection =
-        RpcClient::new_with_commitment(SOLANA_URL.to_string(), CommitmentConfig::confirmed());
+    let connection = Arc::new(RpcClient::new_with_commitment(
+        SOLANA_URL.to_string(),
+        CommitmentConfig::confirmed(),
+    ));
 
-    // Load processed slots
-    let mut processed_slots = load_processed_slots(PROCESSED_SLOTS_FILE)?;
+    let processed_slots = Arc::new(Mutex::new(load_processed_slots(PROCESSED_SLOTS_FILE)?));
 
-    // Initialize counters for timing
-    let mut total_blocks: u64 = 0;
-    let mut total_time = Duration::new(0, 0);
+    let processed_slots_for_signal = Arc::clone(&processed_slots);
+    tokio::spawn(async move {
+        signal::ctrl_c().await.expect("Failed to listen for CTRL+C");
+        info!("Signal received! Saving processed slots...");
+
+        let processed_slots = processed_slots_for_signal.lock().unwrap();
+        if let Err(e) = save_processed_slots(PROCESSED_SLOTS_FILE, &*processed_slots) {
+            error!("Failed to save processed slots: {}", e);
+        }
+
+        std::process::exit(0);
+    });
 
     loop {
         match connection.get_slot().await {
             Ok(latest_slot) => {
                 info!("Latest slot from Solana: {}", latest_slot);
 
-                // Start processing from the latest slot and go backwards
                 let mut slot = latest_slot;
 
-                while slot > 0 {
-                    let start_time = Instant::now();
+                let semaphore = std::sync::Arc::new(Semaphore::new(MAX_PARALLEL_REQUESTS));
+                let total_blocks = Arc::new(Mutex::new(0u64));
+                let start_time = Arc::new(Instant::now());
 
-                    if processed_slots.contains(&slot) {
+                while slot > 0 {
+                    if processed_slots.lock().unwrap().contains(&slot) {
                         info!("Slot {} already processed. Skipping.", slot);
                         return Ok(());
                     }
 
-                    if let Err(e) = process_slot(slot, &connection, &dynamo_client).await {
-                        error!("Error processing slot {}: {}", slot, e);
-                        // Depending on the error, decide to continue or break
-                        slot -= 1;
-                        continue;
-                    }
+                    let permit = semaphore.clone().acquire_owned().await;
+                    let connection_clone = Arc::clone(&connection);
+                    let dynamo_client_clone = Arc::clone(&dynamo_client);
+                    let total_blocks = Arc::clone(&total_blocks);
+                    let start_time = Arc::clone(&start_time);
+                    let processed_slots = Arc::clone(&processed_slots);
 
-                    processed_slots.insert(slot);
-                    save_processed_slots(PROCESSED_SLOTS_FILE, &processed_slots)?;
+                    tokio::spawn(async move {
+                        let slot_start_time = Instant::now(); // Independent task start time
 
-                    let elapsed = start_time.elapsed();
-                    total_time += elapsed;
-                    total_blocks += 1;
+                        if let Err(e) =
+                            process_slot(slot, connection_clone, dynamo_client_clone).await
+                        {
+                            error!("Error processing slot {}: {}", slot, e);
+                        }
 
-                    // Calculate average blocks per second
-                    let elapsed_secs = total_time.as_secs_f64();
-                    let average_bps = if elapsed_secs > 0.0 {
-                        total_blocks as f64 / elapsed_secs
-                    } else {
-                        0.0
-                    };
+                        let mut processed_slots_guard = processed_slots.lock().unwrap();
+                        processed_slots_guard.insert(slot);
 
-                    info!(
-                        "Finished processing slot {}. Time taken: {:.2?}. Average blocks/sec: {:.2}",
-                        slot, elapsed, average_bps
-                    );
+                        drop(permit);
+
+                        {
+                            let mut total_blocks_guard = total_blocks.lock().unwrap();
+                            *total_blocks_guard += 1;
+                        }
+
+                        let elapsed_secs_slot = slot_start_time.elapsed().as_secs_f64();
+                        let elapsed_secs = start_time.elapsed().as_secs_f64();
+                        let average_bps = if elapsed_secs > 0.0 {
+                            *total_blocks.lock().unwrap() as f64 / elapsed_secs
+                        } else {
+                            0.0
+                        };
+
+                        info!(
+                            "Slot {} processed in {:?}. Total blocks: {}. Average BPS: {:.2}",
+                            slot,
+                            elapsed_secs_slot,
+                            *total_blocks.lock().unwrap(),
+                            average_bps
+                        );
+                    });
 
                     slot -= 1;
 
                     // Optional: Add a short delay to prevent tight looping
-                    // sleep(Duration::from_millis(100)).await;
+                    sleep(Duration::from_secs(1)).await;
                 }
             }
             Err(e) => {
                 error!("Error fetching latest slot: {}", e);
-                // Wait before retrying
                 sleep(Duration::from_secs(5)).await;
             }
         }
