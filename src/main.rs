@@ -83,7 +83,9 @@ async fn initialize_mongodb() -> Result<Collection<SolanaFee>> {
 
     let client = Client::with_options(client_options).with_context(|| "Creating MongoDB client")?;
 
-    let collection = client.database(DATABASE_NAME).collection::<SolanaFee>(COLLECTION_NAME);
+    let collection = client
+        .database(DATABASE_NAME)
+        .collection::<SolanaFee>(COLLECTION_NAME);
 
     collection
         .create_index(
@@ -198,7 +200,7 @@ async fn process_slot(
 
 /// Fetches a block with retries.
 async fn get_block(slot: u64, connection: Arc<RpcClient>) -> Result<UiConfirmedBlock, ClientError> {
-    let mut attempts = 0;
+    let mut attempts = 1;
 
     loop {
         match connection
@@ -218,7 +220,7 @@ async fn get_block(slot: u64, connection: Arc<RpcClient>) -> Result<UiConfirmedB
                     "Failed to fetch block {} (attempt {}): {}",
                     slot, attempts, e
                 );
-                if attempts < 5 {
+                if attempts <= 5 {
                     sleep(Duration::from_secs(10)).await;
                     attempts += 1;
                 } else {
@@ -243,47 +245,58 @@ async fn main() -> Result<()> {
         CommitmentConfig::confirmed(),
     ));
 
+    let mut slot = match std::env::args().nth(1) {
+        Some(s) => {
+            info!("Slot specified by user: {}", s);
+            s.parse::<u64>().expect("Failed to parse slot number")
+        }
+        None => match connection.get_slot().await {
+            Ok(latest_slot) => {
+                info!(
+                    "Using the latest slot: {}",
+                    latest_slot - 1
+                );
+                latest_slot
+            }
+            Err(e) => {
+                error!(
+                    "Error fetching the latest slot: {}",
+                    e
+                );
+                return Err(e.into());
+            }
+        },
+    };
+
     let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_REQUESTS));
     let mut last_request_time = Instant::now();
 
-
     loop {
-        if let Ok(latest_slot) = connection.get_slot().await {
-            info!("Latest slot: {}", latest_slot);
-
-            let mut slot = latest_slot - 1;
-
-            while slot > 0 {
-                if is_slot_processed(slot, &slot.to_string(), Arc::clone(&collection)).await? {
-                    info!("Slot {} already processed. Skipping...", slot);
-                    slot -= 1;
-                    continue;
-                }
-
-                let elapsed = last_request_time.elapsed();
-                if elapsed < REQUEST_INTERVAL {
-                    sleep(REQUEST_INTERVAL - elapsed).await;
-                }
-                last_request_time = Instant::now();
-
-                let connection_clone = Arc::clone(&connection);
-                let collection_clone = Arc::clone(&collection);
-                let permit = semaphore.clone().acquire_owned().await;
-
-                tokio::spawn(async move {
-                    if let Err(e) = process_slot(slot, connection_clone, collection_clone).await {
-                        error!("Failed to process slot {}: {}", slot, e);
-                    } else {
-                        info!("Processed slot {}", slot);
-                    }
-                    drop(permit);
-                });
-
-                slot -= 1;
-            }
-        } else {
-            error!("Failed to fetch the latest slot. Retrying...");
-            sleep(Duration::from_secs(5)).await;
+        if is_slot_processed(slot, &slot.to_string(), Arc::clone(&collection)).await? {
+            info!("Slot {} already processed. Skipping...", slot);
+            slot -= 1;
+            continue;
         }
+
+        let elapsed = last_request_time.elapsed();
+        if elapsed < REQUEST_INTERVAL {
+            sleep(REQUEST_INTERVAL - elapsed).await;
+        }
+        last_request_time = Instant::now();
+
+        let connection_clone = Arc::clone(&connection);
+        let collection_clone = Arc::clone(&collection);
+        let permit = semaphore.clone().acquire_owned().await;
+
+        tokio::spawn(async move {
+            if let Err(e) = process_slot(slot, connection_clone, collection_clone).await {
+                error!("Failed to process slot {}: {}", slot, e);
+            } else {
+                info!("Processed slot {}", slot);
+            }
+            drop(permit);
+        });
+
+        slot -= 1;
     }
 }
