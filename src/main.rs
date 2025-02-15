@@ -82,17 +82,64 @@ async fn initialize_mongodb() -> Result<Collection<SlotData>> {
     Ok(collection)
 }
 
+fn check_if_vote_transaction(tx: &EncodedTransactionWithStatusMeta) -> bool {
+    let vote_program_id = "Vote111111111111111111111111111111111111111";
+
+    let message =
+        if let solana_transaction_status::EncodedTransaction::Json(tx_raw) = &tx.transaction {
+            &tx_raw.message
+        } else {
+            return false;
+        };
+
+    match message {
+        solana_transaction_status::UiMessage::Raw(message_raw) => {
+            message_raw.instructions.iter().any(|instruction| {
+                message_raw
+                    .account_keys
+                    .get(instruction.program_id_index as usize)
+                    .map_or(false, |key| key == vote_program_id)
+            })
+        }
+        solana_transaction_status::UiMessage::Parsed(message_parsed) => message_parsed
+            .instructions
+            .iter()
+            .any(|instruction| match instruction {
+                solana_transaction_status::UiInstruction::Parsed(instruction_parsed) => {
+                    match instruction_parsed {
+                        solana_transaction_status::UiParsedInstruction::Parsed(
+                            instruction_parsed_parsed,
+                        ) => instruction_parsed_parsed.program_id == vote_program_id,
+                        solana_transaction_status::UiParsedInstruction::PartiallyDecoded(
+                            instruction_parsed_partially_decoded,
+                        ) => instruction_parsed_partially_decoded.program_id == vote_program_id,
+                    }
+                }
+                solana_transaction_status::UiInstruction::Compiled(instruction_compiled) => {
+                    message_parsed
+                        .account_keys
+                        .get(instruction_compiled.program_id_index as usize)
+                        .map_or(false, |key| key.pubkey == vote_program_id)
+                }
+            }),
+    }
+}
+
 /// Converts a Solana transaction into a `TransactionFee` item.
 fn build_transaction_item(tx: &EncodedTransactionWithStatusMeta) -> Option<TransactionFee> {
-    let meta = tx.meta.as_ref()?;
-    let fee = meta.fee as i64;
-    let compute_units_consumed = meta.clone().compute_units_consumed.unwrap_or(0) as i64;
+    if check_if_vote_transaction(tx) {
+        return None;
+    }
 
     let signatures = match &tx.transaction {
         solana_transaction_status::EncodedTransaction::Json(tx_raw) => &tx_raw.signatures,
         solana_transaction_status::EncodedTransaction::Accounts(tx_raw) => &tx_raw.signatures,
         _ => return None,
     };
+
+    let meta = tx.meta.as_ref()?;
+    let fee = meta.fee as i64;
+    let compute_units_consumed = meta.clone().compute_units_consumed.unwrap_or(0) as i64;
 
     let base_fee = BASE_FEE * signatures.len() as i64;
     let priority_fee = fee.saturating_sub(base_fee);
