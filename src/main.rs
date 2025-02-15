@@ -205,7 +205,7 @@ async fn main() -> Result<()> {
 
     loop {
         if is_slot_processed(slot, &collection).await? {
-            slot -= 1;
+            slot += 1;
             continue;
         }
 
@@ -216,6 +216,6 @@ async fn main() -> Result<()> {
         }
 
         sleep(Duration::from_millis(REQUEST_INTERVAL_MS)).await;
-        slot -= 1;
+        slot += 1;
     }
 }
