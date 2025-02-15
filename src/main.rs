@@ -1,4 +1,3 @@
-use std::time::Duration;
 use anyhow::{Context, Result};
 use log::{error, info};
 use mongodb::{
@@ -10,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use solana_client::{nonblocking::rpc_client::RpcClient, rpc_config::RpcBlockConfig};
 use solana_sdk::commitment_config::CommitmentConfig;
 use solana_transaction_status::EncodedTransactionWithStatusMeta;
+use std::time::Duration;
 use tokio::time::sleep;
 
 // -----------------------
@@ -61,24 +61,28 @@ async fn initialize_mongodb() -> Result<Collection<SlotData>> {
 
     client_options.app_name = Some("SolanaFeeProcessor".to_string());
 
-    let client = Client::with_options(client_options)
-        .with_context(|| "Creating MongoDB client")?;
+    let client = Client::with_options(client_options).with_context(|| "Creating MongoDB client")?;
 
-    let collection = client
-        .database(DATABASE_NAME)
-        .collection::<SlotData>(COLLECTION_NAME);
+    let database = client.database(DATABASE_NAME);
+    let collection = database.collection::<SlotData>(COLLECTION_NAME);
 
-    collection
-        .create_index(
-            IndexModel::builder()
-                .keys(doc! { "slot": 1 })
-                .options(IndexOptions::builder().unique(true).build())
-                .build(),
-        )
-        .await
-        .with_context(|| "Creating unique index on 'slot' field")?;
+    let index_names = collection.list_index_names().await?;
+    if !index_names.contains(&"slot_1".to_string()) {
+        collection
+            .create_index(
+                IndexModel::builder()
+                    .keys(doc! { "slot": 1 })
+                    .options(IndexOptions::builder().unique(true).build())
+                    .build(),
+            )
+            .await
+            .with_context(|| "Creating unique index on 'slot' field")?;
+        info!("Created unique index on 'slot' field.");
+    } else {
+        info!("Unique index on 'slot' field already exists.");
+    }
 
-    info!("Connected to MongoDB and ensured indexes.");
+    info!("Connected to MongoDB and verified indexes.");
     Ok(collection)
 }
 
@@ -240,14 +244,18 @@ async fn main() -> Result<()> {
     env_logger::init();
 
     let collection = initialize_mongodb().await?;
-    let connection = RpcClient::new_with_commitment(
-        SOLANA_URL.to_string(),
-        CommitmentConfig::confirmed(),
-    );
+    let connection =
+        RpcClient::new_with_commitment(SOLANA_URL.to_string(), CommitmentConfig::confirmed());
 
     let mut slot = match std::env::args().nth(1) {
         Some(s) => s.parse::<i64>().context("Invalid slot number")?,
-        None => connection.get_slot().await.context("Failed to fetch slot")? as i64 - 1,
+        None => {
+            connection
+                .get_slot()
+                .await
+                .context("Failed to fetch slot")? as i64
+                - 1
+        }
     };
 
     loop {
